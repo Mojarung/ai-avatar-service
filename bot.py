@@ -5,6 +5,7 @@
 #
 
 import os
+import asyncio
 
 from loguru import logger
 
@@ -88,7 +89,8 @@ def _make_stop_interview(transport: DailyTransport, api_base_url: str, auth_head
                         logger.info(f"Interview {interview_id} updated successfully")
                         # Disconnect WebRTC session
                         try:
-                            time.sleep(10)
+                            # Дадим ассистенту время договорить прощание перед разрывом соединения
+                            await asyncio.sleep(8)
                             await transport.output().stop(EndFrame())
                             logger.info("Transport disconnected")
                         except Exception as e:
