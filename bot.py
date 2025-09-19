@@ -36,13 +36,7 @@ from pipecat.transports.services.daily import DailyTransport, DailyParams
 from pipecat.processors.transcript_processor import TranscriptProcessor
 # Load environment variables
 
-logger.add(
-    "pipecat_debug.log",
-    rotation="10 MB",
-    retention="7 days",
-    level="DEBUG",
-    format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level} | {name}:{function}:{line} - {message}"
-)
+
 # We store functions so objects (e.g. SileroVADAnalyzer) don't get
 # instantiated. The function will be called when the desired transport gets
 # selected.
