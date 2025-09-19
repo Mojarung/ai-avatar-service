@@ -33,7 +33,7 @@ from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
 import aiohttp
 import json
 from schemas import InterviewResponse
-from pipecat.transports.services.daily import DailyTransport, DailyParams
+from pipecat.transports.daily.transport import DailyTransport, DailyParams
 from pipecat.processors.transcript_processor import TranscriptProcessor
 # Load environment variables
 
