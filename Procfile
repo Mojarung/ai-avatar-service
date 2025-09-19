@@ -1,0 +1,1 @@
+web: uvicorn avatar:router --host 0.0.0.0 --port ${PORT:-8000} --log-level info --access-log --proxy-headers
