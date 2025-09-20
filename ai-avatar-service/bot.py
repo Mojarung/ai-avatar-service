@@ -9,7 +9,7 @@ import asyncio
 
 from loguru import logger
 
-from pipecat.frames.frames import LLMRunFrame, EndFrame
+from pipecat.frames.frames import LLMMessagesAppendFrame, LLMRunFrame, EndFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
@@ -35,9 +35,19 @@ import json
 from schemas import InterviewResponse
 from pipecat.transports.daily.transport import DailyTransport, DailyParams
 from pipecat.processors.transcript_processor import TranscriptProcessor
+from pipecat.processors.user_idle_processor import UserIdleProcessor
 # Load environment variables
-
-
+async def handle_idle(user_idle: UserIdleProcessor, retry_count: int):
+    if retry_count == 1:
+        message = {"role":"system", "content": "Пользователь молчит. Спросили, пожалуйста, его вежливо, здесь ли он ещё или нет"}
+        await user_idle.push_frame(LLMMessagesAppendFrame([message], run_llm=True))
+        return True
+    if retry_count == 2:
+        message = {"role":"system", "content": "Пользователь не отвечает уже долго. Попрощайся, пожалуйста, с ним и заверши интервью"}
+        await user_idle.push_frame(LLMMessagesAppendFrame([message], run_llm=True))
+        return True
+    else:
+        return False
 # We store functions so objects (e.g. SileroVADAnalyzer) don't get
 # instantiated. The function will be called when the desired transport gets
 # selected.
@@ -64,7 +74,7 @@ async def get_current_datetime(params: FunctionCallParams):
     datetime_data = {"datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
     await params.result_callback(datetime_data)
 # Create a tools schema with your functions
-def _make_stop_interview(transport: DailyTransport, api_base_url: str, auth_headers: dict, interview_id: int, transcription_ref: dict):
+def _make_stop_interview(transport: DailyTransport, api_base_url: str, auth_headers: dict, interview_id: int, transcription_ref: dict, task_ref: dict):
     async def _stop_interview(params: FunctionCallParams):
         try:
             args = params.arguments or {}
@@ -87,12 +97,12 @@ def _make_stop_interview(transport: DailyTransport, api_base_url: str, auth_head
                         await params.result_callback({"ok": False, "status": resp.status, "body": resp_text})
                     else:
                         logger.info(f"Interview {interview_id} updated successfully")
-                        # Disconnect WebRTC session
+                        # First, give the assistant time to finish the farewell
                         try:
-                            # Дадим ассистенту время договорить прощание перед разрывом соединения
-                            await asyncio.sleep(8)
-                            await transport.output().stop(EndFrame())
-                            logger.info("Transport disconnected")
+                            task = task_ref.get("task")
+                            if task:
+                                await task.stop_when_done()
+                                logger.info("Pipeline task cancelled")
                         except Exception as e:
                             logger.error(f"Error disconnecting transport: {e}")
                         await params.result_callback({"ok": True})
@@ -105,7 +115,7 @@ def _make_stop_interview(transport: DailyTransport, api_base_url: str, auth_head
     return _stop_interview
 
 async def run_bot(interview_id, room_url, token):
-    logger.info(f"Starting bot")
+    logger.info("Starting bot")
     pipecat_transport = DailyTransport(
         room_url=room_url,
         token=token,
@@ -122,7 +132,10 @@ async def run_bot(interview_id, room_url, token):
         vad_analyzer=None
     ),
     )
-
+    user_idle = UserIdleProcessor(
+        callback=handle_idle,
+        timeout=5
+    )
     # Configure API base and auth for server-to-server calls
     api_base_url = os.getenv("API_BASE_URL", "http://localhost:8000")
     api_token = None
@@ -134,7 +147,7 @@ async def run_bot(interview_id, room_url, token):
             else:
                 logger.error(f"Failed to get API token. Status code: {response.status}")
     auth_headers = {"Authorization": f"Bearer {api_token}"} if api_token else {}
-
+    interview_data = None
     async with aiohttp.ClientSession() as session:
         async with session.get(f"{api_base_url}/interviews/{interview_id}", headers=auth_headers) as response:
             if response.status == 200:
@@ -175,10 +188,10 @@ async def run_bot(interview_id, room_url, token):
 * Сопоставь их с резюме, определи главные темы для проверки.
 
 **2. Проведение интервью (взаимодействие с кандидатом):**
-* **Структура по времени:** Придерживайся плана: Вступление (~5%), Основные вопросы (~70%), Вопросы кандидата (~15%), Завершение (~10%). Следи за тем, чтобы не превышать время интервью(проверяй периодически время)
+* **Структура по времени:** Придерживайся плана: Вступление (~5%), Основные вопросы (~70%), Вопросы кандидата (~15%), Завершение (~10%). Следи за тем, чтобы не превышать время интервью(проверяй периодически время).
 * **Начало:** Кратко представься и озвучь план беседы.
 * **Диалог:** Задавай по **одному** вопросу за раз. Если ответ неполный — задавай уточняющие вопросы.
-* **Завершение:** Будь нейтрален. Поблагодари, озвучь следующие шаги (например, «Мы свяжемся с вами в течение N дней») и пожелай хорошего дня. Не давай никаких намеков на решение.
+* **Завершение:** Будь нейтрален. Поблагодари, озвучь следующие шаги (например, «Мы свяжемся с вами в течение N дней») и пожелай хорошего дня. Не давай никаких намеков на решение. (Завершай интервью только после того, как попрощаешься с кандидатом. чтобы отключение не было резким)
 
 **3. Итоговый отчет (для HR-менеджера):**
 * **Оценка по компетенциям:**
@@ -221,23 +234,12 @@ async def run_bot(interview_id, room_url, token):
     context_aggregator = llm.create_context_aggregator(context)
     # Shared transcription object to accumulate dialogue during session
     transcription = {"dialogue": []}
-    llm.register_function(
-    "get_current_datetime",
-    get_current_datetime,
-    cancel_on_interruption=True,  # Cancel if user interrupts (default: True)
-    )
-    # Register stop_interview tool to allow LLM to save summary and end the session
-    llm.register_function(
-        "stop_interview",
-        _make_stop_interview(pipecat_transport, api_base_url, auth_headers, interview_id, transcription),
-        cancel_on_interruption=True,
-    )
+    # Register tools will be done after the pipeline task is created so we can cancel it
     simli = SimliVideoService(
         SimliConfig(
             apiKey=os.getenv("SIMLI_API_KEY"),
             faceId=os.getenv("SIMLI_FACE_ID"),
-            handleSilence=True,
-            maxIdleTime=30,
+            handleSilence=True
         ),
         use_turn_server=True,
         latency_interval=0
@@ -247,6 +249,7 @@ async def run_bot(interview_id, room_url, token):
     pipeline = Pipeline(
         [
             pipecat_transport.input(),
+            user_idle,
             context_aggregator.user(),
             transcript.user(),
             llm,
@@ -265,11 +268,24 @@ async def run_bot(interview_id, room_url, token):
             enable_usage_metrics=True,
         )
     )
+    # Provide task into the stop_interview closure via a ref dict
+    task_ref = {"task": task}
+    # Now register functions including stop_interview with access to task
+    llm.register_function(
+        "get_current_datetime",
+        get_current_datetime,
+        cancel_on_interruption=True,
+    )
+    llm.register_function(
+        "stop_interview",
+        _make_stop_interview(pipecat_transport, api_base_url, auth_headers, interview_id, transcription, task_ref),
+        cancel_on_interruption=True,
+    )
 
     # Handle client connection event
     @pipecat_transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
-        logger.info(f"Client connected")
+        logger.info("Client connected")
         # Kick off the conversation.
         await task.queue_frames(
             [
@@ -280,7 +296,7 @@ async def run_bot(interview_id, room_url, token):
     # Handle client disconnection events
     @pipecat_transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
-        logger.info(f"Client disconnected")
+        logger.info("Client disconnected")
         await task.cancel()
     @transcript.event_handler("on_transcript_update")
     async def on_transcript_update(processor, frame):

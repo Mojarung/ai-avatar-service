@@ -1,0 +1,25 @@
+[cerebrium.hardware]
+region = "us-east-1"
+provider = "aws"
+compute = "CPU"
+cpu = 4
+memory = 5.0
+[cerebrium.dependencies.pip]
+dotenv = ">=0.9.9"
+fastapi = ">=0.116.1"
+onnxruntime = ">=1.22.1"
+opencv-python = ">=4.11.0.86"
+"pipecat-ai[google,runner,simli,daily]" = ">=0.0.84"
+pydantic = ">=2.11.9"
+sqlalchemy = ">=2.0.43"
+aiohttp = "latest"
+[cerebrium.dependencies.apt]
+libgl1 = "latest"
+"libglib2.0-0" = "latest"
+[cerebrium.deployment]
+name = "ai-avatar-service"
+[cerebrium.runtime.custom]
+entrypoint = ["uvicorn", "avatar:router", "--host", "0.0.0.0", "--port", "8080", "--log-level", "info", "--access-log", "--proxy-headers"]
+port = 8080
+healthcheck_endpoint = ""  # Empty string uses TCP health check
+readycheck_endpoint = ""  # Empty string uses TCP health check

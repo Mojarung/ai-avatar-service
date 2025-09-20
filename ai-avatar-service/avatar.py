@@ -43,7 +43,7 @@ async def lifespan(app: FastAPI):
     yield
     await aiohttp_session.close()
 
-router = FastAPI()
+router = FastAPI(lifespan=lifespan)
 router.add_middleware(
     CORSMiddleware,
     allow_origins=[
