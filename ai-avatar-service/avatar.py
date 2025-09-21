@@ -95,6 +95,27 @@ async def offer(interview_id: int, background_tasks: BackgroundTasks):
     background_tasks.add_task(run_bot, interview_id, room.url, token)
     return {"url": room.url, "token": token}
 
+@router.post("/resume-completion-interview/{interview_id}")
+async def resume_completion_interview(interview_id: int, background_tasks: BackgroundTasks, request_data: Dict = None):
+    """
+    Запускает AI-интервью для дозаполнения резюме пользователя
+    """
+    logger.info(f"Starting resume completion interview for interview_id: {interview_id}")
+    
+    room = await daily_helpers["rest"].create_room(DailyRoomParams())
+    if not room.url:
+        raise HTTPException(status_code=500, detail="Failed to create room")
+    token = await daily_helpers["rest"].get_token(room.url)
+    if not token:
+        raise HTTPException(status_code=500, detail="Failed to get token")
+    
+    # Извлекаем контекст интервью из запроса
+    interview_context = request_data.get("context", {}) if request_data else {}
+    
+    # Используем универсальный run_bot с контекстом
+    background_tasks.add_task(run_bot, interview_id, room.url, token, interview_context)
+    return {"url": room.url, "token": token}
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="WebRTC demo")
     parser.add_argument(

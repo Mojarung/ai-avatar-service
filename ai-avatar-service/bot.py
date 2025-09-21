@@ -69,7 +69,28 @@ stop_interview = FunctionSchema(
     },
     required=["report"]
 )
-tools = ToolsSchema(standard_tools=[datetime_function, stop_interview])
+
+complete_resume_interview = FunctionSchema(
+    name="complete_resume_interview",
+    description="Complete the resume completion interview and save collected information",
+    properties={
+        "profile_updates": {
+            "type": "object",
+            "description": "Collected profile information to update user's profile"
+        },
+        "summary": {
+            "type": "string",
+            "description": "Summary of the interview and collected information"
+        }
+    },
+    required=["profile_updates", "summary"]
+)
+
+# Выбираем tools в зависимости от типа интервью
+if interview_type == "resume_completion":
+    tools = ToolsSchema(standard_tools=[datetime_function, complete_resume_interview])
+else:
+    tools = ToolsSchema(standard_tools=[datetime_function, stop_interview])
 async def get_current_datetime(params: FunctionCallParams):
     # Fetch weather data from your API
     datetime_data = {"datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
@@ -115,8 +136,57 @@ def _make_stop_interview(transport: DailyTransport, api_base_url: str, auth_head
                 pass
     return _stop_interview
 
-async def run_bot(interview_id, room_url, token):
+def _make_complete_resume_interview(transport: DailyTransport, api_base_url: str, auth_headers: dict, interview_id: int, transcription_ref: dict, task_ref: dict, interview_context: dict):
+    async def _complete_resume_interview(params: FunctionCallParams):
+        try:
+            args = params.arguments or {}
+            profile_updates = args.get("profile_updates", {})
+            summary = args.get("summary", "")
+
+            payload = {
+                "end_date": datetime.now().isoformat(),
+                "summary": summary,
+                "profile_updates": profile_updates
+            }
+            
+            # Attach dialogue transcription if available
+            if transcription_ref:
+                payload["dialogue"] = transcription_ref
+            
+            logger.info(f"Resume completion interview {interview_id} completed with profile updates: {list(profile_updates.keys())}")
+            
+            async with aiohttp.ClientSession() as session:
+                # Save results via API
+                url = f"{api_base_url}/ai-resume-interview/complete-interview/{interview_id}"
+                async with session.post(url, json=payload, headers=auth_headers) as resp:
+                    resp_text = await resp.text()
+                    if resp.status >= 400:
+                        logger.error(f"Failed to complete resume interview {interview_id}: {resp.status} {resp_text}")
+                        await params.result_callback({"ok": False, "status": resp.status, "body": resp_text})
+                    else:
+                        logger.info(f"Resume interview {interview_id} completed successfully")
+                        # Give the assistant time to finish the farewell
+                        try:
+                            task = task_ref.get("task")
+                            if task:
+                                await task.stop_when_done()
+                                logger.info("Pipeline task cancelled")
+                        except Exception as e:
+                            logger.error(f"Error disconnecting transport: {e}")
+                        await params.result_callback({"ok": True})
+        except Exception as e:
+            logger.exception("Unhandled error in complete_resume_interview")
+            try:
+                await params.result_callback({"ok": False, "error": str(e)})
+            except Exception:
+                pass
+    return _complete_resume_interview
+
+async def run_bot(interview_id, room_url, token, interview_context=None):
     logger.info("Starting bot")
+    
+    # Определяем тип интервью
+    interview_type = interview_context.get("interview_type", "hr_interview") if interview_context else "hr_interview"
     pipecat_transport = DailyTransport(
         room_url=room_url,
         token=token,
@@ -148,33 +218,110 @@ async def run_bot(interview_id, room_url, token):
             else:
                 logger.error(f"Failed to get API token. Status code: {response.status}")
     auth_headers = {"Authorization": f"Bearer {api_token}"} if api_token else {}
-    interview_data = None
-    async with aiohttp.ClientSession() as session:
-        async with session.get(f"{api_base_url}/interviews/{interview_id}", headers=auth_headers) as response:
-            if response.status == 200:
-                interview_data = await response.json()
-                logger.info(f"Interview data: {interview_data}")
-            else:
-                logger.error(f"Failed to get interview data. Status code: {response.status}")
-    interview = InterviewResponse.model_validate(interview_data)
-    vacancy = interview.vacancy
-    resume = interview.resume
-    # Получаем JSON-дружелюбные dict, чтобы корректно сериализовать Enum и datetime
-    vacancy_dict = vacancy.model_dump(
-        mode='json',
-        exclude={"id", "original_url", "creator_id", "hr_id", "auto_interview_enabled", "created_at", "updated_at", "status"}
-    )
-    resume_dict = resume.model_dump(
-        mode='json',
-        exclude={"id", "user_id", "vacancy_id", "file_path", "original_filename", "uploaded_at", "processed", "uploaded_by_hr", "hidden_for_hr", "updated_at", "status", "user"}
-    )
-
-    vacancy_data = json.dumps(vacancy_dict, ensure_ascii=False, indent=2)
-    resume_data = json.dumps(resume_dict, ensure_ascii=False, indent=2)
     
-    logger.info(f"Vacancy data: {vacancy_data}")
-    logger.info(f"Resume data: {resume_data}")
-    system_instruction = f"""
+    if interview_type == "resume_completion":
+        # Для интервью дозаполнения резюме используем данные из контекста
+        user_profile = interview_context.get("user_profile", {})
+        resume_data = interview_context.get("resume_data", {})
+        gaps_analysis = interview_context.get("gaps_analysis", {})
+        interview_questions = interview_context.get("interview_questions", [])
+        estimated_duration = interview_context.get("estimated_duration", 15)
+        
+        vacancy_data = "Интервью для дозаполнения резюме"
+        resume_data = json.dumps(resume_data, ensure_ascii=False, indent=2)
+        
+        logger.info(f"Resume completion interview for user: {user_profile.get('name', 'Unknown')}")
+        logger.info(f"Gaps analysis: {gaps_analysis}")
+    else:
+        # Обычное HR-интервью - получаем данные из API
+        interview_data = None
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"{api_base_url}/interviews/{interview_id}", headers=auth_headers) as response:
+                if response.status == 200:
+                    interview_data = await response.json()
+                    logger.info(f"Interview data: {interview_data}")
+                else:
+                    logger.error(f"Failed to get interview data. Status code: {response.status}")
+        interview = InterviewResponse.model_validate(interview_data)
+        vacancy = interview.vacancy
+        resume = interview.resume
+        # Получаем JSON-дружелюбные dict, чтобы корректно сериализовать Enum и datetime
+        vacancy_dict = vacancy.model_dump(
+            mode='json',
+            exclude={"id", "original_url", "creator_id", "hr_id", "auto_interview_enabled", "created_at", "updated_at", "status"}
+        )
+        resume_dict = resume.model_dump(
+            mode='json',
+            exclude={"id", "user_id", "vacancy_id", "file_path", "original_filename", "uploaded_at", "processed", "uploaded_by_hr", "hidden_for_hr", "updated_at", "status", "user"}
+        )
+
+        vacancy_data = json.dumps(vacancy_dict, ensure_ascii=False, indent=2)
+        resume_data = json.dumps(resume_dict, ensure_ascii=False, indent=2)
+        
+        logger.info(f"Vacancy data: {vacancy_data}")
+        logger.info(f"Resume data: {resume_data}")
+    if interview_type == "resume_completion":
+        # Системная инструкция для дозаполнения резюме
+        questions_text = ""
+        for i, question in enumerate(interview_questions, 1):
+            questions_text += f"{i}. {question['question']}\n"
+        
+        system_instruction = f"""
+Ты — Александра, профессиональный HR-консультант, который помогает кандидатам улучшить их резюме.
+
+**Задача:** Провести интервью для дозаполнения резюме кандидата на **русском языке**. Твоя роль — собрать недостающую информацию и уточнить детали для создания полного профиля.
+
+**Кандидат:** {user_profile.get('name', 'Пользователь')} ({user_profile.get('email', '')})
+**Ожидаемая длительность интервью:** {estimated_duration} минут
+**Текущее время:** {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+
+---
+
+### **План Интервью для Дозаполнения Резюме**
+
+**1. Приветствие и объяснение цели (2-3 минуты):**
+- Представься и объясни, что цель интервью — помочь улучшить резюме
+- Уточни, что собранная информация будет использована для автоматического дозаполнения профиля
+
+**2. Сбор недостающей информации ({estimated_duration-5} минут):**
+Используй следующие вопросы как основу, но адаптируй их под ответы кандидата:
+{questions_text}
+
+**3. Завершение (2-3 минуты):**
+- Поблагодари кандидата за время
+- Объясни, что информация будет обработана и профиль обновлен
+- Пожелай удачи в поиске работы
+
+---
+
+### **Правила Интервью:**
+
+1. **Задавай по одному вопросу за раз** и жди полного ответа
+2. **Уточняй детали** — если ответ поверхностный, задавай дополнительные вопросы
+3. **Будь вежливой и профессиональной** — создавай комфортную атмосферу
+4. **Фокусируйся на профессиональной информации** — избегай личных тем
+5. **Запрещенные темы:** адрес, семейное положение, религия, политика
+6. **Собирай конкретную информацию:** технологии, проекты, достижения, даты
+
+### **Анализ Пробелов в Резюме:**
+{gaps_analysis.get('gaps_analysis', {})}
+
+**Обязательные поля для заполнения:**
+{', '.join(gaps_analysis.get('missing_required_fields', []))}
+
+**Приоритетные области:**
+{', '.join(gaps_analysis.get('interview_plan', {}).get('focus_areas', []))}
+
+---
+
+### **Важно:**
+- Произноси числительные на русском языке (например, "три" вместо "3")
+- Завершай интервью только после того, как попрощаешься с кандидатом
+- Используй функцию complete_resume_interview для сохранения собранной информации
+"""
+    else:
+        # Системная инструкция для обычного HR-интервью
+        system_instruction = f"""
 Ты — Александра, продвинутый HR-интервьюер.
 
 **Задача:** Провести структурированное интервью на **русском языке**, соблюдая этические нормы (без дискриминационных вопросов). Твоя роль — оценить кандидата и подготовить отчет для HR-менеджера, **а не принимать решение о найме**.
@@ -201,21 +348,42 @@ async def run_bot(interview_id, room_url, token):
 * **Риски / Зоны роста:** (список 1-2)
 * **Рекомендация:** `[Рекомендовать / Рассмотреть / Не рекомендовать]` с четкой аргументацией.
 Пожалуйста, произноси числительные на русском языке, для этого можешь перевести их в письменную форму, например, 3 - "три"
-    """
-    context = OpenAILLMContext(
-    messages=[
-        {
-            "role": "system",
-            "content": system_instruction
-        },
-        {
-            "role": "user",
-            "content": f"""**Входные данные о кандидате:**
+"""
+    if interview_type == "resume_completion":
+        context = OpenAILLMContext(
+            messages=[
+                {
+                    "role": "system",
+                    "content": system_instruction
+                },
+                {
+                    "role": "user",
+                    "content": f"""**Начинаем интервью для дозаполнения резюме**
+
+Кандидат: {user_profile.get('name', 'Пользователь')}
+Цель: Собрать недостающую информацию для улучшения резюме
+Время: {estimated_duration} минут
+
+Начни с приветствия и объяснения цели интервью."""
+                }
+            ]
+        )
+    else:
+        context = OpenAILLMContext(
+            messages=[
+                {
+                    "role": "system",
+                    "content": system_instruction
+                },
+                {
+                    "role": "user",
+                    "content": f"""**Входные данные о кандидате:**
 * **Вакансия: {vacancy_data}**
 * **Резюме: {resume_data}**
 * **Время (минут):5**. Поприветствуй кандидата и начни собеседование."""
-        }
-    ])
+                }
+            ]
+        )
     llm = GeminiMultimodalLiveLLMService(
         api_key=os.getenv("GOOGLE_API_KEY"),
         system_instruction=system_instruction,
@@ -275,17 +443,25 @@ async def run_bot(interview_id, room_url, token):
     )
     # Provide task into the stop_interview closure via a ref dict
     task_ref = {"task": task}
-    # Now register functions including stop_interview with access to task
+    # Now register functions depending on interview type
     llm.register_function(
         "get_current_datetime",
         get_current_datetime,
         cancel_on_interruption=True,
     )
-    llm.register_function(
-        "stop_interview",
-        _make_stop_interview(pipecat_transport, api_base_url, auth_headers, interview_id, transcription, task_ref),
-        cancel_on_interruption=True,
-    )
+    
+    if interview_type == "resume_completion":
+        llm.register_function(
+            "complete_resume_interview",
+            _make_complete_resume_interview(pipecat_transport, api_base_url, auth_headers, interview_id, transcription, task_ref, interview_context),
+            cancel_on_interruption=True,
+        )
+    else:
+        llm.register_function(
+            "stop_interview",
+            _make_stop_interview(pipecat_transport, api_base_url, auth_headers, interview_id, transcription, task_ref),
+            cancel_on_interruption=True,
+        )
 
     # Handle client connection event
     @pipecat_transport.event_handler("on_client_connected")
